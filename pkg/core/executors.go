@@ -231,96 +231,107 @@ func (e *Engine) executeTemplateOnInput(ctx context.Context, template *templates
 	ctxArgs.MetaInput = value
 	scanCtx := scan.NewScanContext(ctx, ctxArgs)
 
-	// CRITICAL: Check if HostTechCache exists
-	if e.HostTechCache == nil {
-		gologger.Warning().Msgf("[tech-filter] ERROR: HostTechCache is NIL! Tech filtering is disabled.")
-	} else {
-		gologger.Warning().Msgf("[tech-filter] HostTechCache is initialized!")
-	}
-
 	// --- Tech-stack probe: ONE-TIME per host ---
-	if e.HostTechCache != nil {
-		// Only probe if we have NO hint for this host yet
-		if !e.HostTechCache.HasHint(value.Input) {
-			gologger.Warning().Msgf("[tech-filter] PROBE: Attempting probe for host '%s'", value.Input)
-			
-			// Send a lightweight HEAD request to detect Server header
-			client := &http.Client{
-				Timeout: 5 * time.Second,
-				CheckRedirect: func(req *http.Request, via []*http.Request) error {
-					return http.ErrUseLastResponse // Don't follow redirects
-				},
-			}
-			
-			// Build full URL if needed
-			targetURL := value.Input
-			if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
-				targetURL = "http://" + targetURL
-			}
-			
-			gologger.Warning().Msgf("[tech-filter] PROBE: Sending HEAD to '%s'", targetURL)
-			
-			resp, err := client.Head(targetURL)
+	if e.HostTechCache != nil && !e.HostTechCache.HasHint(value.Input) {
+		// Send a lightweight GET request to detect Server header
+		client := &http.Client{
+			Timeout: 2 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		
+		// Build full URL if needed
+		targetURL := value.Input
+		if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+			targetURL = "http://" + targetURL
+		}
+		
+		// Create a GET request
+		req, err := http.NewRequest("GET", targetURL, nil)
+		if err == nil {
+			resp, err := client.Do(req)
 			if err == nil && resp != nil {
 				defer resp.Body.Close()
 				if serverHdr := resp.Header.Get("Server"); serverHdr != "" {
-					gologger.Warning().Msgf("[tech-filter] PROBE SUCCESS: Found Server header '%s' for host '%s'",
-						serverHdr, value.Input)
 					e.HostTechCache.RecordServerHeader(value.Input, serverHdr)
 				} else {
-					gologger.Warning().Msgf("[tech-filter] PROBE: No Server header for host '%s'", value.Input)
 					e.HostTechCache.RecordNoServerHeader(value.Input)
 				}
 			} else {
-				gologger.Warning().Msgf("[tech-filter] PROBE FAILED for host '%s': %v", value.Input, err)
 				e.HostTechCache.RecordNoServerHeader(value.Input)
 			}
 		} else {
-			gologger.Warning().Msgf("[tech-filter] PROBE: Already have hint for host '%s', skipping probe", value.Input)
+			e.HostTechCache.RecordNoServerHeader(value.Input)
 		}
 	}
 	// --- end probe ---
 
 	// --- Tech-stack based template filtering ---
-	gologger.Warning().Msgf("[tech-filter] CHECK: Checking if should skip template '%s' for host '%s'", template.ID, value.Input)
+	gologger.Debug().Msgf("[tech-filter] CHECK: Checking if should skip template '%s' for host '%s'", template.ID, value.Input)
 
 	if e.HostTechCache != nil {
-		tags := template.Info.Tags.ToSlice()
-		gologger.Warning().Msgf("[tech-filter] Template '%s' has tags: %v", template.ID, tags)
-		
-		if e.HostTechCache.ShouldSkipTemplate(value.Input, tags) {
-			serverHdr := ""
-			if e.HostTechCache.HasHint(value.Input) {
-				serverHdr = e.HostTechCache.GetServerHeader(value.Input)
-			}
-			
-			gologger.Warning().Msgf(
-				"[tech-filter] SKIPPED template '%s' for host '%s' (server='%s', no matching tags)",
-				template.ID, 
-				value.Input,
-				serverHdr,
-			)
-			return false, nil
-		} else {
-			gologger.Warning().Msgf("[tech-filter] ALLOW: Template '%s' passed filter for host '%s'", template.ID, value.Input)
+	tags := template.Info.Tags.ToSlice()
+
+	// Get version ranges from template metadata
+	versionRanges := make(map[string]interface{})
+	if template.Info.Metadata != nil {
+		if ranges, ok := template.Info.Metadata["version-ranges"].(map[string]interface{}); ok {
+			versionRanges = ranges  // Keep the raw interface{} values
 		}
+	}
+
+	gologger.Debug().Msgf("[tech-filter] Template '%s' has tags: %v, version-ranges: %v", 
+		template.ID, tags, versionRanges)
+
+	if e.HostTechCache.ShouldSkipTemplateWithVersion(value.Input, tags, versionRanges) {
+		serverHdr := e.HostTechCache.GetServerHeader(value.Input)
+		version := e.HostTechCache.GetVersion(value.Input)
+		
+		gologger.Debug().Msgf(
+			"[tech-filter] SKIPPED template '%s' for host '%s' (server='%s', version='%s', no matching tags/version)",
+			template.ID, 
+			value.Input,
+			serverHdr,
+			version,
+		)
+		return false, nil
+	} else {
+		gologger.Debug().Msgf("[tech-filter] ALLOW: Template '%s' passed filter for host '%s'", 
+			template.ID, value.Input)
+	}
 	}
 	// --- end tech-stack filtering ---
-
+	// Execute the template
+	var matched bool
+	var err error
+	
 	switch template.Type() {
 	case types.WorkflowProtocol:
-		return e.executeWorkflow(scanCtx, template.CompiledWorkflow), nil
+		matched = e.executeWorkflow(scanCtx, template.CompiledWorkflow)
 	default:
 		if e.Callback != nil {
-			results, err := template.Executer.ExecuteWithResults(scanCtx)
-			if err != nil {
-				return false, err
+			results, execErr := template.Executer.ExecuteWithResults(scanCtx)
+			err = execErr
+			if err == nil && len(results) > 0 {
+				matched = true
+				for _, result := range results {
+					e.Callback(result)
+				}
 			}
-			for _, result := range results {
-				e.Callback(result)
-			}
-			return len(results) > 0, nil
+		} else {
+			matched, err = template.Executer.Execute(scanCtx)
 		}
-		return template.Executer.Execute(scanCtx)
 	}
+
+	//If template matched, update cache with learned tags
+	if matched && e.HostTechCache != nil {
+		tags := template.Info.Tags.ToSlice()
+		e.HostTechCache.RecordTemplateMatch(value.Input, tags)
+		
+		gologger.Debug().Msgf("[tech-filter] Template '%s' MATCHED on '%s' → learning tags: %v", 
+			template.ID, value.Input, tags)
+	}
+
+	return matched, err
 }

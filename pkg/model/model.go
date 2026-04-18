@@ -92,6 +92,7 @@ type Info struct {
 	// examples:
 	//   - value: "\"Change the default administrative username and password of Apache ActiveMQ by editing the file jetty-realm.properties\""
 	Remediation string `json:"remediation,omitempty" yaml:"remediation,omitempty" jsonschema:"title=remediation steps for the template,description=In-depth explanation on how to fix the issues found by the template,example=Change the default administrative username and password of Apache ActiveMQ by editing the file jetty-realm.properties,type=string"`
+	VersionRanges  map[string]string      `yaml:"version-ranges,omitempty" json:"version-ranges,omitempty"`
 }
 
 // JSONSchemaProperty returns the JSON schema property for the Info object.
