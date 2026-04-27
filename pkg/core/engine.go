@@ -33,7 +33,7 @@ func New(options *types.Options) *Engine {
 	}
 	engine.workPool = engine.GetWorkPool()
 	if !options.DisableTechStackFiltering {
-		engine.HostTechCache = hosttechcache.NewHostTechCache()
+		engine.HostTechCache = hosttechcache.New()
 	}
 	return engine
 }

@@ -1,243 +1,734 @@
 package hosttechcache
 
 import (
-	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
-	"github.com/projectdiscovery/gologger"
+	"time"
+
+	"github.com/Masterminds/semver/v3"
 )
 
-// TechHint represents a detected technology on a host that can be used
-// to filter templates before execution.
-type TechHint struct {
-	// ServerHeader stores the original Server header value for logging purposes
-	ServerHeader string
-	Version		string
-	// Tags is the set of template tags that are REQUIRED for this host.
-	// A template is skipped unless it contains at least one of these tags,
-	// or the set is empty (meaning: no filtering).
-	Tags map[string]struct{}
+// knownServerTags maps server header substrings to their canonical tag(s).
+// Only Apache-family servers are "known" — their server header alone is
+// sufficient to identify the tech stack (Apache → likely Tomcat/OFBiz/etc.).
+// Generic servers (Tornado, Nginx, IIS, etc.) are intentionally NOT listed
+// here so they fall through to app-URL detection per the diagram.
+var knownServerTags = map[string][]string{
+	"apache": {"apache"},
+	"coyote": {"apache", "tomcat"},
+	"tomcat": {"apache", "tomcat"},
 }
 
-// HostTechCache stores per-host technology hints derived from early HTTP
-// responses (e.g. the Server: header).  It is safe for concurrent use.
+// normalizeHost strips any http:// or https:// scheme so we always store and
+// look up cache entries under the bare "host[:port]" form.  This prevents
+// double-scheme bugs when value.Input arrives pre-normalised from httpx.
+func normalizeHost(host string) string {
+	host = strings.TrimPrefix(host, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	// Strip any trailing path (keep only host:port)
+	if idx := strings.IndexByte(host, '/'); idx != -1 {
+		host = host[:idx]
+	}
+	return host
+}
+
+// ProbeResult is the outcome of a one-time HTTP probe for a host.
+type ProbeResult int
+
+const (
+	ProbeUnknown        ProbeResult = iota
+	ProbeHasServerMatch             // server header matched a known tag set
+	ProbeHasServerNoMatch           // server header present but unrecognised (Tornado, etc.)
+	ProbeNoServerHeader             // no Server header at all
+)
+
+// TechHint holds everything we know about the tech stack of a single host.
+type TechHint struct {
+	// Probe outcome – drives the filtering logic from the diagram.
+	ProbeResult ProbeResult
+
+	// Layer 1 – server header
+	Server        string
+	ServerVersion string
+
+	// Layer 2 – framework inferred from server
+	Framework        string
+	FrameworkVersion string
+
+	// Layer 3 – application detected via URL probes
+	Application string
+	AppVersion  string
+
+	// All tags that are valid for template matching on this host.
+	// Populated differently depending on which branch of the diagram we took:
+	//   • ProbeHasServerMatch  → server-derived tags only (no deep scan needed)
+	//   • ProbeHasServerNoMatch → app-URL scan tags (or empty → allow all)
+	//   • ProbeNoServerHeader  → app-URL scan tags (or empty → allow all)
+	Tags []string
+
+	// Whether app-URL detection has already been attempted for this host.
+	AppDetectionDone bool
+}
+
+// HostTechCache stores per-host TechHints and drives the diagram logic.
 type HostTechCache struct {
 	mu    sync.RWMutex
-	hints map[string]*TechHint // keyed by normalised host (scheme+host)
+	cache map[string]*TechHint
 }
 
-// NewHostTechCache returns an initialised HostTechCache.
-func NewHostTechCache() *HostTechCache {
-	return &HostTechCache{hints: make(map[string]*TechHint)}
+func New() *HostTechCache {
+	return &HostTechCache{
+		cache: make(map[string]*TechHint),
+	}
 }
 
-// RecordServerHeader inspects a raw Server header value and, if it contains
-// a known technology keyword, records a tag requirement for that host.
-//
-// Currently understood keywords → required tag:
-//
-//	"apache" → "apache"
-//
-// The mapping is intentionally simple and lowercase-compared so that
-// "Apache/2.4.51 (Unix)" and "apache" both resolve to the same hint.
-func (c *HostTechCache) RecordServerHeader(host, serverHeader string) {
-	lower := strings.ToLower(serverHeader)
+// HasHint returns true when we have already probed this host at the server
+// level (i.e. the one-time HTTP probe has been fired).
+func (h *HostTechCache) HasHint(host string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	hint, ok := h.cache[normalizeHost(host)]
+	return ok && hint.ProbeResult != ProbeUnknown
+}
 
-	var requiredTags []string
-	var detectedVersion string
-	
-	// Detect different server types
-	if strings.Contains(lower, "apache") {
-		requiredTags = append(requiredTags, "apache")
-		detectedVersion = extractVersion(serverHeader)
-	}
-	/*
-	} else if strings.Contains(lower, "nginx") {
-		requiredTags = append(requiredTags, "nginx")
-		detectedVersion = extractVersion(serverHeader)
-	} else if strings.Contains(lower, "iis") || strings.Contains(lower, "microsoft") {
-		requiredTags = append(requiredTags, "iis", "microsoft")
-		detectedVersion = extractVersion(serverHeader)
-	} else if strings.Contains(lower, "tomcat") {
-		requiredTags = append(requiredTags, "apache", "tomcat")
-		detectedVersion = extractVersion(serverHeader)
-	} else if strings.Contains(lower, "jetty") {
-		requiredTags = append(requiredTags, "jetty")
-		detectedVersion = extractVersion(serverHeader)
-	} else if strings.Contains(lower, "websphere") {
-		requiredTags = append(requiredTags, "websphere", "ibm")
-		detectedVersion = extractVersion(serverHeader)
-	} else if strings.Contains(lower, "weblogic") {
-		requiredTags = append(requiredTags, "weblogic", "oracle")
-		detectedVersion = extractVersion(serverHeader)
-	}
-	*/
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// GetHint returns the stored hint (may be nil).
+func (h *HostTechCache) GetHint(host string) (*TechHint, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	hint, ok := h.cache[normalizeHost(host)]
+	return hint, ok
+}
 
-	if len(requiredTags) == 0 {
-		// Unknown server - record but don't filter
-		c.hints[host] = &TechHint{
-			ServerHeader: serverHeader,
-			Version:      detectedVersion,
-			Tags:         make(map[string]struct{}),
+// ─────────────────────────────────────────────────────────────────────────────
+// Recording probe outcomes  (called from executor after the one-time GET)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// RecordServerHeader is called when the one-time probe finds a Server header.
+// It implements the LEFT branch of the diagram:
+//
+//	Server header present
+//	  → matched to known app tags  → ProbeHasServerMatch  (use cached tags)
+//	  → not matched                → ProbeHasServerNoMatch (run app-URL detection later)
+func (h *HostTechCache) RecordServerHeader(host, serverHeader string) {
+	host = normalizeHost(host)
+	server, version := ParseServerHeader(serverHeader)
+	framework := MapServerToFramework(server)
+	tags := matchKnownServerTags(server)
+
+	result := ProbeHasServerNoMatch
+	if len(tags) > 0 {
+		result = ProbeHasServerMatch
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cache[host] = &TechHint{
+		ProbeResult:   result,
+		Server:        server,
+		ServerVersion: version,
+		Framework:     framework,
+		Tags:          tags,
+	}
+}
+
+// RecordNoServerHeader is called when the one-time probe finds NO Server header.
+// This is the RIGHT branch of the diagram:
+//
+//	No Server header → run all possible app-URL detection
+func (h *HostTechCache) RecordNoServerHeader(host string) {
+	host = normalizeHost(host)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cache[host] = &TechHint{
+		ProbeResult: ProbeNoServerHeader,
+	}
+}
+
+// RecordAppDetection stores the result of app-URL detection and updates tags.
+// Used for both ProbeHasServerNoMatch and ProbeNoServerHeader paths.
+func (h *HostTechCache) RecordAppDetection(host, app, appVersion string, appTags []string) {
+	host = normalizeHost(host)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	hint, ok := h.cache[host]
+	if !ok {
+		hint = &TechHint{}
+		h.cache[host] = hint
+	}
+	hint.Application = app
+	hint.AppVersion = appVersion
+	hint.AppDetectionDone = true
+
+	// Merge app tags with any existing server tags.
+	existing := make(map[string]struct{}, len(hint.Tags))
+	for _, t := range hint.Tags {
+		existing[t] = struct{}{}
+	}
+	for _, t := range appTags {
+		if _, seen := existing[t]; !seen {
+			hint.Tags = append(hint.Tags, t)
 		}
-		gologger.Debug().Msgf("[tech-filter] RECORDED hint for host '%s' — Server: '%s' → UNKNOWN server type, will allow all templates",
-			host, serverHeader)
+	}
+}
+
+// RecordTemplateMatch is called when a template matches; we learn its tags.
+func (h *HostTechCache) RecordTemplateMatch(host string, tags []string) {
+	host = normalizeHost(host)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	hint, ok := h.cache[host]
+	if !ok {
 		return
 	}
-
-	gologger.Debug().Msgf("[tech-filter] RECORDED hint for host '%s' — Server: '%s', Version: '%s' → required tags: %v",
-		host, serverHeader, detectedVersion, requiredTags)
-
-	hint := &TechHint{
-		ServerHeader: serverHeader,
-		Version:      detectedVersion,
-		Tags:         make(map[string]struct{}, len(requiredTags)),
+	existing := make(map[string]struct{}, len(hint.Tags))
+	for _, t := range hint.Tags {
+		existing[t] = struct{}{}
 	}
-	for _, t := range requiredTags {
-		hint.Tags[t] = struct{}{}
+	for _, t := range tags {
+		if _, seen := existing[t]; !seen {
+			hint.Tags = append(hint.Tags, t)
+		}
 	}
-	c.hints[host] = hint
 }
 
-// extractVersion extracts version number from Server header
-func extractVersion(serverHeader string) string {
-	// Examples to handle:
-	// "Apache/2.4.41 (Unix)" -> "2.4.41"
-	// "Apache-Coyote/1.1" -> "1.1"
-	// "Apache Tomcat/8.0.43" -> "8.0.43"
-	
-	parts := strings.Split(serverHeader, "/")
-	if len(parts) >= 2 {
-		version := strings.Split(parts[1], " ")[0] // Remove trailing info
-		version = strings.TrimSpace(version)
-		return version
+// GetServerHeader returns the raw server header value (empty string if unknown).
+func (h *HostTechCache) GetServerHeader(host string) string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if hint, ok := h.cache[normalizeHost(host)]; ok {
+		return hint.Server
 	}
 	return ""
 }
 
-// GetVersion returns the detected version for a host
-func (c *HostTechCache) GetVersion(host string) string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	
-	hint, exists := c.hints[host]
-	if !exists || hint == nil {
+// GetVersion returns the most-specific version we know for a host.
+func (h *HostTechCache) GetVersion(host string) string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	hint, ok := h.cache[normalizeHost(host)]
+	if !ok {
 		return ""
 	}
-	return hint.Version
+	if hint.AppVersion != "" {
+		return hint.AppVersion
+	}
+	if hint.FrameworkVersion != "" {
+		return hint.FrameworkVersion
+	}
+	return hint.ServerVersion
 }
 
-// ShouldSkipTemplate returns true when the cache has a hint for the given host
-// AND the template's tags contain none of the required tags.
-// This is the simpler version without version checking (for backward compatibility)
-func (c *HostTechCache) ShouldSkipTemplate(host string, templateTags []string) bool {
-	c.mu.RLock()
-	hint, ok := c.hints[host]
-	c.mu.RUnlock()
+// ─────────────────────────────────────────────────────────────────────────────
+// Core decision: ShouldSkipTemplateWithVersion
+// Implements all branches of the diagram.
+// ─────────────────────────────────────────────────────────────────────────────
 
-	if !ok || len(hint.Tags) == 0 {
-		return false // no information → don't skip
+// ShouldSkipTemplateWithVersion returns true when this template should be
+// skipped for the given host.  It mirrors the full diagram:
+//
+// Branch A – ProbeHasServerMatch
+//
+//	Server header matched a known tag set → use only those cached tags.
+//	Allow template only if its tags overlap with the cached server tags
+//	(plus version check when present).
+//
+// Branch B – ProbeHasServerNoMatch
+//
+//	Server header was present but unrecognised (Tornado/IIS/Nginx etc.).
+//	App-URL detection should have run already (triggered by the executor).
+//	  • App match   → allow only templates whose tags match app tags.
+//	  • No app match → allow ALL templates (safe fallback).
+//
+// Branch C – ProbeNoServerHeader
+//
+//	No server header.  App-URL detection should have run already.
+//	  • App match   → allow only templates whose tags match app tags.
+//	  • No app match → allow ALL templates (safe fallback).
+func (h *HostTechCache) ShouldSkipTemplateWithVersion(
+	host string,
+	templateTags []string,
+	versionRanges map[string]interface{},
+) bool {
+	h.mu.RLock()
+	hint, ok := h.cache[normalizeHost(host)]
+	h.mu.RUnlock()
+
+	// No probe result at all → allow everything.
+	if !ok || hint.ProbeResult == ProbeUnknown {
+		return false
 	}
 
-	for _, tag := range templateTags {
-		if _, required := hint.Tags[strings.ToLower(tag)]; required {
-			return false // template has at least one matching tag → keep it
+	switch hint.ProbeResult {
+
+	// ── Branch A: server header matched a known Apache-family tag ────────────
+	// We know the server is Apache/Tomcat. Only skip templates that have
+	// explicit tech tags AND those tags don't overlap with apache/tomcat.
+	// Generic tagless templates already passed the check above.
+	case ProbeHasServerMatch:
+		if !tagsOverlap(templateTags, hint.Tags) {
+			return true // skip – clearly a different tech stack
 		}
+		return !versionAllowed(hint, versionRanges)
+
+	// ── Branch B: server header present but unrecognised (Tornado/Nginx/IIS) ─
+	// App-URL detection runs to try to identify the specific application.
+	case ProbeHasServerNoMatch:
+		if !hint.AppDetectionDone {
+			return false // detection not done yet → allow
+		}
+		if hint.Application != "" {
+			// We identified a specific app (Airflow/OFBiz/Druid/CXF).
+			// Only run templates whose tags match the detected app.
+			if !tagsOverlap(templateTags, hint.Tags) {
+				return true
+			}
+			return !versionAllowed(hint, versionRanges)
+		}
+		// No specific app detected → allow ALL templates (safe fallback).
+		return false
+
+	// ── Branch C: no server header at all ───────────────────────────────────
+	case ProbeNoServerHeader:
+		if !hint.AppDetectionDone {
+			return false
+		}
+		if hint.Application != "" {
+			if !tagsOverlap(templateTags, hint.Tags) {
+				return true
+			}
+			return !versionAllowed(hint, versionRanges)
+		}
+		// No app detected → allow ALL templates.
+		return false
 	}
-	return true // no matching tag found → skip
+
+	return false
 }
 
-// ShouldSkipTemplateWithVersion checks both tags AND version ranges
-func (c *HostTechCache) ShouldSkipTemplateWithVersion(host string, templateTags []string, versionRanges map[string]interface{}) bool {
-	c.mu.RLock()
-	hint, ok := c.hints[host]
-	c.mu.RUnlock()
-
-	if !ok || len(hint.Tags) == 0 {
-		return false // no information → don't skip
-	}
-
-	// First check tags
-	hasMatchingTag := false
-	for _, tag := range templateTags {
-		if _, required := hint.Tags[strings.ToLower(tag)]; required {
-			hasMatchingTag = true
-			break
-		}
-	}
-	
-	if !hasMatchingTag {
-		return true // no matching tag → skip
-	}
-
-	// If tags match, check version ranges
-	if len(versionRanges) > 0 && hint.Version != "" {
-		if !versionMatches(hint.Version, versionRanges) {
-			return true // version doesn't match → skip
-		}
-	}
-
-	return false // tag matches and (no version check OR version matches) → don't skip
+// ShouldSkipTemplate is a convenience wrapper for callers (e.g. tmplexec)
+// that do not have version-range metadata. It delegates to
+// ShouldSkipTemplateWithVersion with no version constraints.
+func (h *HostTechCache) ShouldSkipTemplate(host string, templateTags []string) bool {
+	return h.ShouldSkipTemplateWithVersion(host, templateTags, nil)
 }
 
-// versionMatches checks if detected version matches the template's version ranges
+// NeedsAppDetection returns true when the host is in a state where we should
+// run app-URL detection before the next template is evaluated.
+func (h *HostTechCache) NeedsAppDetection(host string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	hint, ok := h.cache[normalizeHost(host)]
+	if !ok {
+		return false
+	}
+	if hint.AppDetectionDone {
+		return false
+	}
+	// Both "no server header" and "server header but unrecognised" need app detection.
+	return hint.ProbeResult == ProbeNoServerHeader || hint.ProbeResult == ProbeHasServerNoMatch
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// App-URL detection (unchanged from original, called from executor)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ProbeHost fires a lightweight GET at the host, reads the Server header, and
+// records the outcome. This is the same logic as the executor's
+// probeHostServerHeader but exposed so that non-engine callers (e.g. tmplexec)
+// can trigger it directly without importing the engine package.
+func (h *HostTechCache) ProbeHost(host string) {
+	bareHost := normalizeHost(host) // e.g. "127.0.0.1:98" — used as cache key and for URL building
+
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, err := http.NewRequest("GET", "http://"+bareHost, nil)
+	if err != nil {
+		h.RecordNoServerHeader(bareHost)
+		return
+	}
+
+	resp, err := client.Do(req)
+	if err != nil || resp == nil {
+		h.RecordNoServerHeader(bareHost)
+		return
+	}
+	defer resp.Body.Close()
+
+	serverHdr := resp.Header.Get("Server")
+	if serverHdr != "" {
+		h.RecordServerHeader(bareHost, serverHdr)
+	} else {
+		h.RecordNoServerHeader(bareHost)
+	}
+}
+
+// RunAppDetection performs deep app-URL probes for a host and stores the result.
+// target may include a scheme; it is normalized to bare host:port internally.
+func (h *HostTechCache) RunAppDetection(target string) {
+	bareHost := normalizeHost(target)
+	app, version, appTags := DetectApplication(bareHost)
+	h.RecordAppDetection(bareHost, app, version, appTags)
+}
+
+// DetectApplication performs application-level detection via URL probes.
+func DetectApplication(target string) (app string, version string, additionalTags []string) {
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	if isAirflow, ver := detectAirflow(client, target); isAirflow {
+		return "Airflow", ver, []string{"airflow", "celery", "flower", "apache"}
+	}
+	if isOFBiz, ver := detectOFBiz(client, target); isOFBiz {
+		return "OFBiz", ver, []string{"ofbiz", "apache"}
+	}
+	if isDruid, ver := detectDruid(client, target); isDruid {
+		return "Druid", ver, []string{"druid", "apache"}
+	}
+	if isCFX, ver := detectCFX(client, target); isCFX {
+		return "CFX", ver, []string{"cxf", "apache", "soap", "webservice"}
+	}
+
+	return "", "", []string{}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// matchKnownServerTags returns the canonical tags for a server name, or nil
+// if the server is not in the known list.
+func matchKnownServerTags(server string) []string {
+	serverLower := strings.ToLower(server)
+	for keyword, tags := range knownServerTags {
+		if strings.Contains(serverLower, keyword) {
+			return tags
+		}
+	}
+	return nil
+}
+
+// tagsOverlap returns true when at least one tag from templateTags is present
+// in hostTags. Only cached host tags allow templates through.
+func tagsOverlap(templateTags, hostTags []string) bool {
+	set := make(map[string]struct{}, len(hostTags))
+	for _, t := range hostTags {
+		set[strings.ToLower(t)] = struct{}{}
+	}
+	for _, t := range templateTags {
+		if _, ok := set[strings.ToLower(t)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// versionAllowed returns true when either no version constraint is set or the
+// detected version satisfies the constraint.
+func versionAllowed(hint *TechHint, versionRanges map[string]interface{}) bool {
+	if len(versionRanges) == 0 {
+		return true
+	}
+	version := hint.AppVersion
+	if version == "" {
+		version = hint.FrameworkVersion
+	}
+	if version == "" {
+		version = hint.ServerVersion
+	}
+	if version == "" {
+		return true // no version detected → safe fallback: allow
+	}
+	return versionMatches(version, versionRanges)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Parsing helpers (unchanged from original)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func ParseServerHeader(serverHeader string) (string, string) {
+	if serverHeader == "" {
+		return "", ""
+	}
+	parts := strings.Split(serverHeader, "/")
+	if len(parts) == 1 {
+		return strings.TrimSpace(parts[0]), ""
+	}
+	server := strings.TrimSpace(parts[0])
+	versionPart := strings.TrimSpace(parts[1])
+	version := strings.FieldsFunc(versionPart, func(r rune) bool {
+		return r == ' ' || r == '('
+	})[0]
+	return server, version
+}
+
+func MapServerToFramework(server string) string {
+	serverLower := strings.ToLower(server)
+	if strings.Contains(serverLower, "coyote") {
+		return "Tomcat"
+	}
+	if strings.Contains(serverLower, "tornado") {
+		return "Tornado"
+	}
+	if strings.Contains(serverLower, "nginx") {
+		return "nginx"
+	}
+	if strings.Contains(serverLower, "iis") {
+		return "IIS"
+	}
+	return ""
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// App-level URL detectors (unchanged from original)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func detectAirflow(client *http.Client, target string) (bool, string) {
+	resp, err := client.Get("http://" + target + "/dashboard")
+	if err == nil && resp.StatusCode == 200 {
+		resp.Body.Close()
+		resp2, err2 := client.Get("http://" + target + "/")
+		if err2 == nil {
+			defer resp2.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp2.Body, 8192))
+			return true, extractVersion(string(body), "Celery", "Flower")
+		}
+		return true, ""
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	resp, err = client.Get("http://" + target + "/api/workers")
+	if err == nil && resp.StatusCode == 200 {
+		resp.Body.Close()
+		return true, ""
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	resp, err = client.Get("http://" + target + "/admin/")
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		bodyStr := string(body)
+		if strings.Contains(strings.ToLower(bodyStr), "airflow") {
+			return true, extractVersion(bodyStr, "Airflow")
+		}
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	return false, ""
+}
+
+func detectOFBiz(client *http.Client, target string) (bool, string) {
+	resp, err := client.Get("http://" + target + "/control/main")
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		if strings.Contains(strings.ToLower(string(body)), "ofbiz") {
+			return true, extractVersion(string(body), "OFBiz")
+		}
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	resp, err = client.Get("http://" + target + "/catalog/control/login")
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		if strings.Contains(strings.ToLower(string(body)), "ofbiz") {
+			return true, ""
+		}
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	resp, err = client.Get("http://" + target + "/webtools/control/main")
+	if err == nil && resp.StatusCode == 200 {
+		resp.Body.Close()
+		return true, ""
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	return false, ""
+}
+
+func detectDruid(client *http.Client, target string) (bool, string) {
+	resp, err := client.Get("http://" + target + "/unified-console.html")
+	if err == nil && resp.StatusCode == 200 {
+		resp.Body.Close()
+		resp2, err2 := client.Get("http://" + target + "/status")
+		if err2 == nil {
+			defer resp2.Body.Close()
+			body, _ := io.ReadAll(io.LimitReader(resp2.Body, 4096))
+			return true, extractVersion(string(body), "version")
+		}
+		return true, ""
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	resp, err = client.Get("http://" + target + "/druid/coordinator/v1/leader")
+	if err == nil && resp.StatusCode == 200 {
+		resp.Body.Close()
+		return true, ""
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	resp, err = client.Get("http://" + target + "/status/health")
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if strings.Contains(strings.ToLower(string(body)), "druid") {
+			return true, ""
+		}
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	return false, ""
+}
+
+func detectCFX(client *http.Client, target string) (bool, string) {
+	resp, err := client.Get("http://" + target + "/services")
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		bodyStr := string(body)
+		if strings.Contains(strings.ToLower(bodyStr), "cxf") ||
+			strings.Contains(strings.ToLower(bodyStr), "web services") {
+			return true, extractVersion(bodyStr, "CXF", "Apache CXF")
+		}
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	resp, err = client.Get("http://" + target + "/test?wsdl")
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		bodyStr := strings.ToLower(string(body))
+		if strings.Contains(bodyStr, "wsdl") &&
+			(strings.Contains(bodyStr, "cxf") || strings.Contains(bodyStr, "soap")) {
+			return true, ""
+		}
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	return false, ""
+}
+
+func extractVersion(body string, keywords ...string) string {
+	bodyLower := strings.ToLower(body)
+	for _, keyword := range keywords {
+		keywordLower := strings.ToLower(keyword)
+		patterns := []string{
+			keywordLower + " version ",
+			keywordLower + " v",
+			keywordLower + "/",
+			keywordLower + "-",
+		}
+		for _, pattern := range patterns {
+			idx := strings.Index(bodyLower, pattern)
+			if idx != -1 {
+				start := idx + len(pattern)
+				if start < len(body) {
+					snippet := body[start:min(start+20, len(body))]
+					for i, ch := range snippet {
+						if !isVersionChar(ch) {
+							if i > 0 {
+								potentialVersion := snippet[:i]
+								if strings.Contains(potentialVersion, ".") {
+									return potentialVersion
+								}
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func isVersionChar(ch rune) bool {
+	return (ch >= '0' && ch <= '9') || ch == '.' || ch == '-'
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Version matching (unchanged from original)
+// ─────────────────────────────────────────────────────────────────────────────
+
 func versionMatches(detectedVersion string, versionRanges map[string]interface{}) bool {
+	detected, err := semver.NewVersion(detectedVersion)
+	if err != nil {
+		return true
+	}
 	for rangeType, rangeValue := range versionRanges {
 		switch rangeType {
 		case "equals":
-			// Handle both single string and array of strings
-			if strVal, ok := rangeValue.(string); ok {
-				// Single version: "2.0.0"
-				if detectedVersion == strVal {
+			for _, ver := range toStringArray(rangeValue) {
+				target, err := semver.NewVersion(ver)
+				if err != nil {
+					continue
+				}
+				if detected.Equal(target) {
 					return true
 				}
-			} else if arrVal, ok := rangeValue.([]interface{}); ok {
-				// Array of versions: ["2.0.0", "2.1.0", "2.2.0"]
-				for _, item := range arrVal {
-					if strItem, ok := item.(string); ok {
-						if detectedVersion == strItem {
-							return true
-						}
-					}
-				}
 			}
-			
 		case "less_than":
-			// Handle both single string and array of strings
-			if strVal, ok := rangeValue.(string); ok {
-				// Single threshold: "9.0.0"
-				if compareVersions(detectedVersion, strVal) < 0 {
-					return true
+			for _, threshold := range toStringArray(rangeValue) {
+				target, err := semver.NewVersion(threshold)
+				if err != nil {
+					continue
 				}
-			} else if arrVal, ok := rangeValue.([]interface{}); ok {
-				// Array of thresholds: ["9.0.0", "10.0.0"]
-				// Version matches if it's less than ANY of the thresholds
-				for _, item := range arrVal {
-					if strItem, ok := item.(string); ok {
-						if compareVersions(detectedVersion, strItem) < 0 {
-							return true
-						}
-					}
+				if detected.LessThan(target) {
+					return true
 				}
 			}
-			
 		case "between-inclusive":
-			// Handle both single string and array of strings
-			if strVal, ok := rangeValue.(string); ok {
-				// Single range: "2.0.0,2.3.33"
-				if matchesBetweenInclusive(detectedVersion, strVal) {
-					return true
+			for _, rangeStr := range toStringArray(rangeValue) {
+				parts := strings.Split(rangeStr, ",")
+				if len(parts) != 2 {
+					continue
 				}
-			} else if arrVal, ok := rangeValue.([]interface{}); ok {
-				// Array of ranges: ["2.0.0,2.3.33", "2.5,2.5.10.1"]
-				for _, item := range arrVal {
-					if strItem, ok := item.(string); ok {
-						if matchesBetweenInclusive(detectedVersion, strItem) {
-							return true
-						}
-					}
+				lo, err1 := semver.NewVersion(strings.TrimSpace(parts[0]))
+				hi, err2 := semver.NewVersion(strings.TrimSpace(parts[1]))
+				if err1 != nil || err2 != nil {
+					continue
+				}
+				if (detected.Equal(lo) || detected.GreaterThan(lo)) &&
+					(detected.Equal(hi) || detected.LessThan(hi)) {
+					return true
 				}
 			}
 		}
@@ -245,118 +736,21 @@ func versionMatches(detectedVersion string, versionRanges map[string]interface{}
 	return false
 }
 
-// matchesBetweenInclusive checks if version is between min and max (inclusive)
-func matchesBetweenInclusive(version, rangeStr string) bool {
-	parts := strings.Split(rangeStr, ",")
-	if len(parts) != 2 {
-		return false
-	}
-	
-	minVersion := strings.TrimSpace(parts[0])
-	maxVersion := strings.TrimSpace(parts[1])
-	
-	// version >= minVersion AND version <= maxVersion
-	return compareVersions(version, minVersion) >= 0 && compareVersions(version, maxVersion) <= 0
-}
-
-// compareVersions compares two version strings
-// Returns: -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
-func compareVersions(v1, v2 string) int {
-	parts1 := strings.Split(v1, ".")
-	parts2 := strings.Split(v2, ".")
-	
-	maxLen := len(parts1)
-	if len(parts2) > maxLen {
-		maxLen = len(parts2)
-	}
-	
-	for i := 0; i < maxLen; i++ {
-		var p1, p2 int
-		
-		if i < len(parts1) {
-			fmt.Sscanf(parts1[i], "%d", &p1)
+func toStringArray(value interface{}) []string {
+	switch v := value.(type) {
+	case string:
+		return []string{v}
+	case []interface{}:
+		result := make([]string, 0, len(v))
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				result = append(result, str)
+			}
 		}
-		if i < len(parts2) {
-			fmt.Sscanf(parts2[i], "%d", &p2)
-		}
-		
-		if p1 < p2 {
-			return -1
-		} else if p1 > p2 {
-			return 1
-		}
-	}
-	
-	return 0
-}
-
-// HasHint returns true if any hint (including "no recognised tech") has been
-// recorded for this host, so we don't probe the same host twice.
-func (c *HostTechCache) HasHint(host string) bool {
-	c.mu.RLock()
-	_, ok := c.hints[host]
-	c.mu.RUnlock()
-	return ok
-}
-
-
-// RecordNoServerHeader marks that we checked a host but found no Server header
-func (c *HostTechCache) RecordNoServerHeader(host string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	// Create an empty TechHint to indicate we checked but found nothing
-	c.hints[host] = &TechHint{
-		ServerHeader: "",
-		Tags:         make(map[string]struct{}),
-	}
-	gologger.Debug().Msgf("[tech-filter] RECORDED no Server header for host '%s'", host)
-}
-
-// GetServerHeader returns the detected server header for a host
-func (c *HostTechCache) GetServerHeader(host string) string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	
-	hint, exists := c.hints[host]
-	if !exists || hint == nil {
-		return ""
-	}
-	return hint.ServerHeader
-}
-
-// RecordTemplateMatch updates the cache when a template matches
-// This allows learning what technologies are present from successful detections
-func (c *HostTechCache) RecordTemplateMatch(host string, templateTags []string) {
-	if len(templateTags) == 0 {
-		return
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	hint, exists := c.hints[host]
-	if !exists {
-		// Create new hint from template match
-		hint = &TechHint{
-			ServerHeader: "",
-			Version:      "",
-			Tags:         make(map[string]struct{}),
-		}
-		c.hints[host] = hint
-	}
-
-	// Add all template tags to the hint
-	added := []string{}
-	for _, tag := range templateTags {
-		tag = strings.ToLower(tag)
-		if _, exists := hint.Tags[tag]; !exists {
-			hint.Tags[tag] = struct{}{}
-			added = append(added, tag)
-		}
-	}
-
-	if len(added) > 0 {
-		gologger.Debug().Msgf("[tech-filter] LEARNED from template match on host '%s' → added tags: %v", 
-			host, added)
+		return result
+	case []string:
+		return v
+	default:
+		return []string{}
 	}
 }
