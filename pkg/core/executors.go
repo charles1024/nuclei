@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,9 +19,7 @@ import (
 	syncutil "github.com/projectdiscovery/utils/sync"
 )
 
-// Executors are low level executors that deals with template execution on a target.
-
-// executeAllSelfContained executes all self contained templates that do not use `target`.
+// executeAllSelfContained executes all self contained templates
 func (e *Engine) executeAllSelfContained(ctx context.Context, alltemplates []*templates.Template, results *atomic.Bool, sg *sync.WaitGroup) {
 	for _, v := range alltemplates {
 		sg.Add(1)
@@ -46,7 +46,7 @@ func (e *Engine) executeAllSelfContained(ctx context.Context, alltemplates []*te
 	}
 }
 
-// executeTemplateWithTargets executes a given template on x targets (with an internal target pool).
+// executeTemplateWithTargets executes a given template on x targets
 func (e *Engine) executeTemplateWithTargets(ctx context.Context, template *templates.Template, target provider.InputProvider, results *atomic.Bool) {
 	if e.workPool == nil {
 		e.workPool = e.GetWorkPool()
@@ -171,7 +171,7 @@ func (e *Engine) executeTemplateWithTargets(ctx context.Context, template *templ
 	currentInfo.Unlock()
 }
 
-// executeTemplatesOnTarget executes given templates on a single target.
+// executeTemplatesOnTarget execute given templates on given single target
 func (e *Engine) executeTemplatesOnTarget(ctx context.Context, alltemplates []*templates.Template, target *contextargs.MetaInput, results *atomic.Bool) {
 	wp := e.GetWorkPool()
 	defer wp.Wait()
@@ -194,6 +194,7 @@ func (e *Engine) executeTemplatesOnTarget(ctx context.Context, alltemplates []*t
 		sg.Add()
 		go func(template *templates.Template, value *contextargs.MetaInput, wg *syncutil.AdaptiveWaitGroup) {
 			defer wg.Done()
+
 			match, err := e.executeTemplateOnInput(ctx, template, value)
 			if err != nil {
 				e.options.Logger.Warning().Msgf("[%s] Could not execute step on %s: %s\n", e.executerOpts.Colorizer.BrightBlue(template.ID), value.Input, err)
@@ -203,99 +204,83 @@ func (e *Engine) executeTemplatesOnTarget(ctx context.Context, alltemplates []*t
 	}
 }
 
-// executeTemplateOnInput performs template execution for a single input.
-//
-// Tech-stack filtering follows the diagram exactly:
-//
-//	┌─────────────────────────────────────────────────────────────────┐
-//	│                     Nuclei Scan Entry                           │
-//	│              One-time HTTP probe per host                       │
-//	├─────────────────────────────┬───────────────────────────────────┤
-//	│      Server Header          │        No Server Header           │
-//	├──────────┬──────────────────┤  Run all possible app-URL detect. │
-//	│ Matched  │  Not matched     │  If match → update app tag cache  │
-//	│ known    │  (Tornado/IIS…)  │  Allow app tag cache for exec.    │
-//	│ app tags │  Run app-URL     │  If no match → allow all templ.   │
-//	│ Allow    │  detect.         │                                   │
-//	│ cached   │  If no match →   │                                   │
-//	│ server   │  allow all templ.│                                   │
-//	│ tags     │                  │                                   │
-//	└──────────┴──────────────────┴───────────────────────────────────┘
+func (e *Engine) probeHostTech(input string) {
+    client := &http.Client{
+        Timeout: 3 * time.Second,
+        CheckRedirect: func(req *http.Request, via []*http.Request) error {
+            return http.ErrUseLastResponse
+        },
+    }
+    targetURL := input
+    if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+        targetURL = "http://" + targetURL
+    }
+    resp, err := client.Get(targetURL)
+    if err == nil && resp != nil {
+        defer resp.Body.Close()
+        e.HostTechCache.RecordServerHeaderAndProbe(input, resp)
+    } else {
+        e.HostTechCache.RecordNoServerHeader(input)
+    }
+}
+
+// executeTemplateOnInput performs template execution for a single input
 func (e *Engine) executeTemplateOnInput(ctx context.Context, template *templates.Template, value *contextargs.MetaInput) (bool, error) {
 	ctxArgs := contextargs.New(ctx)
 	ctxArgs.MetaInput = value
 	scanCtx := scan.NewScanContext(ctx, ctxArgs)
 
-	// ── Step 1: One-time HTTP probe (server header detection) ─────────────────
-	// Fires once per host; result is cached for all subsequent templates.
-	// ProbeHost is defined on the cache itself so tmplexec can share the same path.
+	// Tech-stack probe: ONE-TIME per host
 	if e.HostTechCache != nil && !e.HostTechCache.HasHint(value.Input) {
-		e.HostTechCache.ProbeHost(value.Input)
+		client := &http.Client{
+			Timeout: 3 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		
+		targetURL := value.Input
+		if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+			targetURL = "http://" + targetURL
+		}
+		
+		resp, err := client.Get(targetURL)
+		if err == nil && resp != nil {
+			defer resp.Body.Close()
+			
+			// FAST: Detect both server + application from single response
+			e.HostTechCache.RecordServerHeaderAndProbe(value.Input, resp)
+		} else {
+			e.HostTechCache.RecordNoServerHeader(value.Input)
+		}
 	}
 
-	// ── Step 2: App-URL detection (for unrecognised / no server header) ───────
-	// Runs once per host when the server header branch could not supply a tag set
-	// (ProbeHasServerNoMatch) or when there was no server header (ProbeNoServerHeader).
-	if e.HostTechCache != nil && e.HostTechCache.NeedsAppDetection(value.Input) {
-		gologger.Debug().Msgf("[tech-filter] Running app-URL detection for host '%s'", value.Input)
-		e.HostTechCache.RunAppDetection(value.Input)
-	}
-
-	// ── Step 3: Template filtering ────────────────────────────────────────────
+	// Tech-stack based template filtering
 	if e.HostTechCache != nil {
 		tags := template.Info.Tags.ToSlice()
-		versionRanges := make(map[string]interface{})
-		if template.Info.Metadata != nil {
-			if ranges, ok := template.Info.Metadata["version-ranges"].(map[string]interface{}); ok {
-				versionRanges = ranges
-			}
-		}
-
-		gologger.Debug().Msgf("[tech-filter] Template '%s' tags=%v version-ranges=%v host='%s'",
-			template.ID, tags, versionRanges, value.Input)
-
-		if e.HostTechCache.ShouldSkipTemplateWithVersion(value.Input, tags, versionRanges) {
-			gologger.Debug().Msgf(
-				"[tech-filter] SKIPPED template '%s' for host '%s' (server='%s', version='%s')",
-				template.ID, value.Input,
-				e.HostTechCache.GetServerHeader(value.Input),
-				e.HostTechCache.GetVersion(value.Input),
-			)
+		
+		if e.HostTechCache.ShouldSkipTemplate(value.Input, tags) {
+			gologger.Debug().Msgf("[tech-filter] SKIPPED template '%s' for host '%s'",
+				template.ID, value.Input)
 			return false, nil
 		}
-
-		gologger.Debug().Msgf("[tech-filter] ALLOW template '%s' for host '%s'", template.ID, value.Input)
 	}
 
-	// ── Step 4: Execute the template ──────────────────────────────────────────
-	var matched bool
-	var err error
-
+	// Execute the template
 	switch template.Type() {
 	case types.WorkflowProtocol:
-		matched = e.executeWorkflow(scanCtx, template.CompiledWorkflow)
+		return e.executeWorkflow(scanCtx, template.CompiledWorkflow), nil
 	default:
 		if e.Callback != nil {
-			results, execErr := template.Executer.ExecuteWithResults(scanCtx)
-			err = execErr
-			if err == nil && len(results) > 0 {
-				matched = true
-				for _, result := range results {
-					e.Callback(result)
-				}
+			results, err := template.Executer.ExecuteWithResults(scanCtx)
+			if err != nil {
+				return false, err
 			}
-		} else {
-			matched, err = template.Executer.Execute(scanCtx)
+			for _, result := range results {
+				e.Callback(result)
+			}
+			return len(results) > 0, nil
 		}
+		return template.Executer.Execute(scanCtx)
 	}
-
-	// ── Step 5: Learning – if matched, record the template's tags ─────────────
-	if matched && e.HostTechCache != nil {
-		tags := template.Info.Tags.ToSlice()
-		e.HostTechCache.RecordTemplateMatch(value.Input, tags)
-		gologger.Debug().Msgf("[tech-filter] Template '%s' MATCHED '%s' → learned tags: %v",
-			template.ID, value.Input, tags)
-	}
-
-	return matched, err
 }

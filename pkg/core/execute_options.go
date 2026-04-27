@@ -57,6 +57,45 @@ func (e *Engine) ExecuteScanWithOpts(ctx context.Context, templatesList []*templ
 		return &atomic.Bool{}
 	}
 
+	// Tech-stack filtering: probe each target once, then filter templates
+	if e.HostTechCache != nil {
+		// Probe all targets first
+		target.Iterate(func(value *contextargs.MetaInput) bool {
+			if !e.HostTechCache.HasHint(value.Input) {
+				e.probeHostTech(value.Input)
+			}
+
+			return true
+		})
+
+		// Filter templates to only those matching detected tech
+		techFiltered := finalTemplates[:0]
+		for _, tpl := range finalTemplates {
+			if tpl.SelfContained {
+				techFiltered = append(techFiltered, tpl)
+				continue
+			}
+			allowed := false
+			target.Iterate(func(value *contextargs.MetaInput) bool {
+				tags := tpl.Info.Tags.ToSlice()
+				if !e.HostTechCache.ShouldSkipTemplate(value.Input, tags) {
+					allowed = true
+					return false
+				}
+				return true
+			})
+			if allowed {
+				techFiltered = append(techFiltered, tpl)
+			}
+		}
+
+		skipped := len(finalTemplates) - len(techFiltered)
+		if skipped > 0 {
+			e.Logger.Info().Msgf("[tech-filter] Filtered %d templates, %d remaining after tech-stack matching", skipped, len(techFiltered))
+		}
+		finalTemplates = techFiltered
+	}
+
 	if e.executerOpts.Progress != nil {
 		// Notes:
 		// workflow requests are not counted as they can be conditional

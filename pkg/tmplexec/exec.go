@@ -275,51 +275,6 @@ func (e *TemplateExecuter) ExecuteWithResults(ctx *scan.ScanContext) ([]*output.
 	ctx.LogWarning("trying ExecuteWithResults - ctx logger")
 	e.options.Logger.Warning().Msgf("trying ExecuteWithResults - e looger")
 
-	// ── Tech-stack filtering (mirrors executors.go logic) ─────────────────────
-	//
-	// We must ensure the one-time probe and app-URL detection have both run
-	// before making a skip decision, because ExecuteWithResults can be called
-	// independently of the core engine path in executors.go.
-	if tc := e.options.HostTechCache; tc != nil {
-		host := ctx.Input.MetaInput.Input
-
-		// Step 1: one-time server-header probe (if not yet done for this host).
-		if !tc.HasHint(host) {
-			tc.ProbeHost(host)
-		}
-
-		// Step 2: app-URL detection for unrecognised / no-server-header hosts.
-		if tc.NeedsAppDetection(host) {
-			gologger.Debug().Msgf("[tech-filter] Running app-URL detection for host '%s'", host)
-			tc.RunAppDetection(host)
-		}
-
-		// Step 3: filter decision.
-		tags := e.options.TemplateInfo.Tags.ToSlice()
-
-		// Extract version-ranges from template metadata when available.
-		versionRanges := make(map[string]interface{})
-		if e.options.TemplateInfo.Metadata != nil {
-			if ranges, ok := e.options.TemplateInfo.Metadata["version-ranges"].(map[string]interface{}); ok {
-				versionRanges = ranges
-			}
-		}
-
-		if tc.ShouldSkipTemplateWithVersion(host, tags, versionRanges) {
-			gologger.Debug().Msgf(
-				"[tech-filter] SKIPPED template '%s' (tags: %v) for host '%s' — no matching tech hint",
-				e.options.TemplateID, tags, host,
-			)
-			e.options.Logger.Warning().Msgf("tryting skip-success")
-			return nil, nil
-		}
-
-		gologger.Debug().Msgf("[tech-filter] ALLOWED template '%s' (tags: %v) for host '%s'",
-			e.options.TemplateID, tags, host)
-		e.options.Logger.Warning().Msgf("tryting skip-success not needed")
-	}
-	// ── end filtering ─────────────────────────────────────────────────────────
-
 	var errx error
 	if e.options.Flow != "" {
 		flowexec, err := flow.NewFlowExecutor(e.requests, ctx, e.options, e.results, e.program)
