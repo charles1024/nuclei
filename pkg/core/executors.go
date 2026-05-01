@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/projectdiscovery/gologger"
+	//"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v3/pkg/input/provider"
 	"github.com/projectdiscovery/nuclei/v3/pkg/output"
 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/contextargs"
@@ -260,27 +260,43 @@ func (e *Engine) executeTemplateOnInput(ctx context.Context, template *templates
 		tags := template.Info.Tags.ToSlice()
 		
 		if e.HostTechCache.ShouldSkipTemplate(value.Input, tags) {
-			gologger.Debug().Msgf("[tech-filter] SKIPPED template '%s' for host '%s'",
-				template.ID, value.Input)
+			//gologger.Debug().Msgf("[tech-filter] SKIPPED template '%s' for host '%s'",
+			//	template.ID, value.Input)
 			return false, nil
 		}
 	}
 
 	// Execute the template
+	var matched bool
+	var err error
+
 	switch template.Type() {
 	case types.WorkflowProtocol:
-		return e.executeWorkflow(scanCtx, template.CompiledWorkflow), nil
+		matched = e.executeWorkflow(scanCtx, template.CompiledWorkflow)
 	default:
 		if e.Callback != nil {
-			results, err := template.Executer.ExecuteWithResults(scanCtx)
-			if err != nil {
-				return false, err
+			results, execErr := template.Executer.ExecuteWithResults(scanCtx)
+			err = execErr
+			if err == nil {
+				for _, result := range results {
+					e.Callback(result)
+				}
+				matched = len(results) > 0
 			}
-			for _, result := range results {
-				e.Callback(result)
-			}
-			return len(results) > 0, nil
+		} else {
+			matched, err = template.Executer.Execute(scanCtx)
 		}
-		return template.Executer.Execute(scanCtx)
 	}
+
+	// Learning: if matched, record product tags into ExtraTags for any
+	// newly discovered technology not seen during the initial probe.
+	// This prunes subsequent templates to focus on the extra tech found.
+	if matched && e.HostTechCache != nil {
+		tags := template.Info.Tags.ToSlice()
+		e.HostTechCache.RecordTemplateMatch(value.Input, tags)
+		//gologger.Debug().Msgf("[tech-filter] Template '%s' MATCHED '%s' → allowed tags now: %v",
+		//	template.ID, value.Input, e.HostTechCache.GetAllowedTags(value.Input))
+	}
+
+	return matched, err
 }
